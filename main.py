@@ -13,6 +13,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 from tracker import IndiaPostTracker, TrackingResult
+from flight_utils import filter_flight_events, generate_flight_summary
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -50,6 +51,19 @@ class TrackingEvent(BaseModel):
     location: Optional[str] = None
 
 
+class FlightInfo(BaseModel):
+    flightNumber: Optional[str] = None
+    airline: Optional[str] = None
+    origin: Optional[str] = None
+    destination: Optional[str] = None
+
+
+class FlightSummary(BaseModel):
+    hasFlightEvents: bool
+    flightEventCount: int
+    flights: List[FlightInfo] = []
+
+
 class TrackingResponse(BaseModel):
     success: bool
     tracking_number: str
@@ -62,12 +76,14 @@ class TrackingResponse(BaseModel):
     article_type: Optional[str] = None
     error: Optional[str] = None
     source: Optional[str] = None
+    flightSummary: Optional[FlightSummary] = None
     timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
 class BulkTrackingRequest(BaseModel):
     tracking_numbers: List[str] = Field(..., min_length=1, max_length=10)
     demo: bool = Field(False, description="Use demo mode for testing")
+    flightOnly: bool = Field(False, description="Filter to only show flight events")
 
 
 class BulkTrackingResponse(BaseModel):
@@ -125,6 +141,7 @@ async def health_check():
 async def track_shipment(
     tracking_number: str,
     demo: bool = Query(False, description="Use demo mode for testing (returns mock data)"),
+    flightOnly: bool = Query(False, description="Filter to only show flight events"),
 ):
     """
     Track a single shipment by tracking number
@@ -132,18 +149,30 @@ async def track_shipment(
     Args:
         tracking_number: India Post tracking number (e.g., LP951627598IN)
         demo: Set to true to get demo/mock data for testing integration
+        flightOnly: Set to true to filter events to only show flight events
 
     Returns:
-        TrackingResponse with tracking information
+        TrackingResponse with tracking information and flight summary
     """
     try:
         result = await track_async(tracking_number, demo_mode=demo)
+
+        # Generate flight summary from all events
+        flight_summary_data = generate_flight_summary(result.events)
+        flight_summary = FlightSummary(
+            hasFlightEvents=flight_summary_data["hasFlightEvents"],
+            flightEventCount=flight_summary_data["flightEventCount"],
+            flights=[FlightInfo(**f) for f in flight_summary_data["flights"]]
+        )
+
+        # Filter events if flightOnly is requested
+        events = filter_flight_events(result.events) if flightOnly else result.events
 
         return TrackingResponse(
             success=result.error is None,
             tracking_number=result.tracking_number,
             status=result.status,
-            events=result.events,
+            events=events,
             origin=result.origin,
             destination=result.destination,
             booked_on=result.booked_on,
@@ -151,6 +180,7 @@ async def track_shipment(
             article_type=result.article_type,
             error=result.error,
             source=result.source,
+            flightSummary=flight_summary,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -160,6 +190,7 @@ async def track_shipment(
 async def track_shipment_query(
     id: str = Query(..., description="Tracking number", example="LP951627598IN"),
     demo: bool = Query(False, description="Use demo mode for testing"),
+    flightOnly: bool = Query(False, description="Filter to only show flight events"),
 ):
     """
     Track a single shipment by tracking number (query parameter)
@@ -167,11 +198,12 @@ async def track_shipment_query(
     Args:
         id: India Post tracking number
         demo: Set to true to get demo/mock data for testing integration
+        flightOnly: Set to true to filter events to only show flight events
 
     Returns:
-        TrackingResponse with tracking information
+        TrackingResponse with tracking information and flight summary
     """
-    return await track_shipment(id, demo)
+    return await track_shipment(id, demo, flightOnly)
 
 
 @app.post("/track/bulk", response_model=BulkTrackingResponse)
@@ -180,10 +212,10 @@ async def track_bulk_shipments(request: BulkTrackingRequest):
     Track multiple shipments at once (max 10)
 
     Args:
-        request: BulkTrackingRequest with list of tracking numbers and optional demo flag
+        request: BulkTrackingRequest with list of tracking numbers, optional demo flag, and optional flightOnly filter
 
     Returns:
-        BulkTrackingResponse with results for all tracking numbers
+        BulkTrackingResponse with results for all tracking numbers including flight summaries
     """
     results = []
     successful = 0
@@ -204,11 +236,23 @@ async def track_bulk_shipments(request: BulkTrackingRequest):
             failed += 1
         else:
             is_success = result.error is None
+
+            # Generate flight summary from all events
+            flight_summary_data = generate_flight_summary(result.events)
+            flight_summary = FlightSummary(
+                hasFlightEvents=flight_summary_data["hasFlightEvents"],
+                flightEventCount=flight_summary_data["flightEventCount"],
+                flights=[FlightInfo(**f) for f in flight_summary_data["flights"]]
+            )
+
+            # Filter events if flightOnly is requested
+            events = filter_flight_events(result.events) if request.flightOnly else result.events
+
             results.append(TrackingResponse(
                 success=is_success,
                 tracking_number=result.tracking_number,
                 status=result.status,
-                events=result.events,
+                events=events,
                 origin=result.origin,
                 destination=result.destination,
                 booked_on=result.booked_on,
@@ -216,6 +260,7 @@ async def track_bulk_shipments(request: BulkTrackingRequest):
                 article_type=result.article_type,
                 error=result.error,
                 source=result.source,
+                flightSummary=flight_summary,
             ))
             if is_success:
                 successful += 1
